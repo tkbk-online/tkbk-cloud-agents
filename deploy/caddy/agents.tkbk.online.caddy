@@ -1,0 +1,25 @@
+# TKBK Cloud Agents — Caddy site block.
+# Do NOT replace /opt/tkbk-shop/Caddyfile (bind-mount!). Append this block to it
+# in place (e.g. `cat deploy/caddy/agents.tkbk.online.caddy >> /opt/tkbk-shop/Caddyfile`)
+# and reload: `docker exec tkbk-caddy caddy reload --config /etc/caddy/Caddyfile`.
+# DNS: A agents.tkbk.online -> 194.87.49.168 before reloading (ACME).
+
+agents.tkbk.online {
+	encode zstd gzip
+	# Only the orchestrator API. Every route (except /health) is HMAC-signed.
+	reverse_proxy tkbk-agents-api:8090 {
+		# Result archives can be large; task starts can wait on a key check.
+		transport http {
+			read_timeout 300s
+			write_timeout 300s
+		}
+	}
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		-Server
+	}
+	log {
+		output stdout
+	}
+}

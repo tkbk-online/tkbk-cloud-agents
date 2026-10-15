@@ -1,0 +1,12 @@
+# Domains a sandbox may reach (squid dstdomain; a leading dot matches subdomains).
+# TKBK gateway
+api.tkbk.online
+# GitHub
+.github.com
+.githubusercontent.com
+# npm
+.npmjs.org
+.npmjs.com
+# PyPI
+.pypi.org
+.pythonhosted.org

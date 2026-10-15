@@ -1,0 +1,35 @@
+{
+  "_comment": "Merge into apps/vscode/package.json -> contributes (TKBK Agent). Stub; see README.md.",
+  "commands": [
+    {
+      "command": "tkbk.runInCloud",
+      "title": "Запустить в облаке TKBK",
+      "category": "TKBK",
+      "icon": "$(cloud-upload)"
+    }
+  ],
+  "menus": {
+    "view/title": [
+      {
+        "command": "tkbk.runInCloud",
+        "group": "navigation@1",
+        "when": "view == tkbk-agent.SidebarProvider"
+      }
+    ]
+  },
+  "configuration": {
+    "title": "TKBK Cloud Agents",
+    "properties": {
+      "tkbk.cloud.url": {
+        "type": "string",
+        "default": "https://agents.tkbk.online",
+        "description": "Адрес оркестратора облачных агентов TKBK"
+      },
+      "tkbk.cloud.secret": {
+        "type": "string",
+        "default": "",
+        "markdownDescription": "ВРЕМЕННО, только для локальной отладки: HMAC-секрет. В релиз не попадает (TODO: per-key auth)."
+      }
+    }
+  }
+}
