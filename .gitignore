@@ -12,3 +12,4 @@ node_modules/
 *.tgz
 .DS_Store
 .smoke-workspace/
+*.egg-info/
