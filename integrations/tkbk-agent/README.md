@@ -1,25 +1,7 @@
-# «Запустить в облаке TKBK» — заглушка для TKBK Agent (форк Cline)
+# Интеграция с TKBK Agent (форк Cline) — что брать
 
-Статус: заглушка с TODO, в `tkbk-online/tkbk-agent` ещё не вшита (там параллельно идёт другая работа, чтобы не пересекаться — файлы лежат здесь, готовые к переносу).
+Актуальный контракт для расширения: [`docs/ide-client.md`](../../docs/ide-client.md) и клиент [`client/tkbkCloudAgents.ts`](../../client/tkbkCloudAgents.ts) (fetch + SSE, без зависимостей, `Authorization: Bearer cr_…` — тот же ключ, что в настройках провайдера TKBK; HMAC-секрет расширению НЕ нужен).
 
-## Что добавить в расширение
+Файлы в этой папке — ранняя заглушка кнопки «Запустить в облаке TKBK» (`runInCloud.ts`, `package.contributes.json`) и устаревший `cloudClient.ts` с HMAC; при переносе в `tkbk-online/tkbk-agent` заменить `cloudClient.ts` на `client/tkbkCloudAgents.ts` и убрать настройку `tkbk.cloud.secret`.
 
-| Файл | Куда в `tkbk-agent` | Что делает |
-|---|---|---|
-| `cloudClient.ts` | `apps/vscode/src/services/tkbk/cloudClient.ts` | Подписанный HMAC-клиент к `agents.tkbk.online`: создать задачу, статус, результат |
-| `runInCloud.ts` | `apps/vscode/src/hosts/vscode/commands/runInCloud.ts` | Команда `tkbk.runInCloud`: берёт repo из git-remote, спрашивает задачу, шлёт, показывает прогресс в status bar |
-| `package.contributes.json` | кусок для `apps/vscode/package.json` | Команда, кнопка в тулбаре чата, настройки |
-
-## Как это работает для клиента
-
-1. В чате TKBK Agent появляется кнопка **«Запустить в облаке TKBK»** (и команда в палитре).
-2. Расширение берёт `origin` текущего репозитория (должен быть GitHub), текущую ветку и текст последнего сообщения пользователя как инструкцию (или спрашивает).
-3. Ключ `cr_…` уже сохранён в настройках провайдера TKBK — он уходит в теле запроса, не хранится на сервере.
-4. GitHub-токен: берётся из VS Code `authentication.getSession('github', ['repo'])` — стандартный GitHub-логин VS Code, без своего хранилища.
-5. Статус опрашивается раз в 10 с; по завершении — уведомление со ссылкой на PR или архив.
-
-## TODO (владелец/разработчик расширения)
-
-- [ ] Решить, где живёт `AGENTS_INTERNAL_SECRET` в расширении. **Секрет HMAC нельзя зашивать в расширение** (его вытащат из .vsix). Варианты: (а) сайт tkbk.online выдаёт расширению короткоживущий токен задачи по ключу `cr_…` и сам подписывает запрос к оркестратору; (б) оркестратор принимает `Authorization: Bearer cr_…` для эндпоинтов задач (тогда HMAC остаётся для бота/сайта/админки). Рекомендация — (б) с лимитом на ключ, см. README корня, раздел «Решения за владельцем».
-- [ ] Перенести файлы, добавить команду в `package.json`, прогнать `bun run check-types` и тесты.
-- [ ] Текст и иконка кнопки в `webview-ui` (ChatView toolbar).
+Сценарий в расширении (кратко): `me()` → план/часы; кнопка → `createTask({repoUrl, prompt})` или `source: "upload"` + `uploadWorkspace(tar.gz)` при незакоммиченных правках / не-GitHub origin; `for await (ev of events(id))` → панель прогресса; по `done` → `diff(id)` → `git apply --3way`.

@@ -49,8 +49,9 @@ def _token_env(token: str | None) -> dict[str, str]:
 async def git(*args: str, cwd: Path | str | None = None, env: dict[str, str] | None = None,
               timeout: float = 300.0) -> str:
     full_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", **(env or {})}
+    # safe.directory=*: task workspaces are chowned to the sandbox user while the orchestrator runs as root.
     proc = await asyncio.create_subprocess_exec(
-        "git", *args, cwd=str(cwd) if cwd else None, env=full_env,
+        "git", "-c", "safe.directory=*", *args, cwd=str(cwd) if cwd else None, env=full_env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     try:
@@ -77,6 +78,24 @@ async def clone(repo_url: str, dest: Path, branch: str | None, token: str | None
 
 async def current_branch(dest: Path) -> str:
     return (await git("rev-parse", "--abbrev-ref", "HEAD", cwd=dest)).strip()
+
+
+async def baseline(dest: Path, name: str, email: str) -> str:
+    """An uploaded working copy: make it a git repo (if needed) and commit its exact state as the base.
+    The patch of the task is computed against this commit. Returns the base sha."""
+    env = {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email,
+           "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email}
+    if not (dest / ".git").exists():
+        await git("init", "-q", "-b", "main", str(dest))
+    await git("add", "-A", cwd=dest)
+    await git("commit", "-q", "--allow-empty", "-m", "TKBK cloud agent: baseline of the uploaded workspace",
+              cwd=dest, env=env)
+    return (await git("rev-parse", "HEAD", cwd=dest)).strip()
+
+
+async def patch(dest: Path, base_sha: str) -> str:
+    """Unified diff base..HEAD, binary-safe (`git apply` friendly)."""
+    return await git("diff", "--binary", "--no-color", f"{base_sha}..HEAD", cwd=dest, timeout=120)
 
 
 async def create_branch(dest: Path, name: str) -> None:

@@ -15,16 +15,26 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .models import ACTIVE_STATUSES, TaskMetrics, TaskResult, TaskStatus, TaskView, UsageRow
+from .models import (
+    ACTIVE_STATUSES,
+    RESERVING_STATUSES,
+    TaskMetrics,
+    TaskResult,
+    TaskStatus,
+    TaskView,
+    UsageRow,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     status TEXT NOT NULL,
     phase TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'repo',
     key_id TEXT NOT NULL,
     key_prefix TEXT NOT NULL,
-    repo TEXT NOT NULL,
+    plan TEXT NOT NULL DEFAULT '',
+    repo TEXT,
     base_branch TEXT,
     work_branch TEXT,
     template TEXT NOT NULL,
@@ -33,8 +43,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     model TEXT NOT NULL,
     provider TEXT NOT NULL,
     deliver TEXT NOT NULL,
+    push INTEGER NOT NULL DEFAULT 0,
     max_minutes INTEGER NOT NULL,
     max_iterations INTEGER NOT NULL,
+    concurrency_limit INTEGER NOT NULL DEFAULT 1,
     client_ref TEXT,
     callback_url TEXT,
     keep_workspace INTEGER NOT NULL DEFAULT 0,
@@ -45,11 +57,18 @@ CREATE TABLE IF NOT EXISTS tasks (
     metrics_json TEXT NOT NULL DEFAULT '{}',
     error TEXT,
     result_json TEXT,
+    events INTEGER NOT NULL DEFAULT 0,
     cancel_requested INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS tasks_key_created ON tasks(key_id, created_at);
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status);
 """
+
+COLS = [
+    "id", "status", "phase", "source", "key_id", "key_prefix", "plan", "repo", "base_branch", "work_branch",
+    "template", "instruction", "issue", "model", "provider", "deliver", "push", "max_minutes", "max_iterations",
+    "concurrency_limit", "client_ref", "callback_url", "keep_workspace", "created_at",
+]
 
 
 def utcnow() -> datetime:
@@ -117,22 +136,21 @@ class TaskStore:
         fields.setdefault("id", new_task_id())
         fields.setdefault("status", TaskStatus.QUEUED)
         fields.setdefault("created_at", utcnow())
-        cols = [
-            "id", "status", "phase", "key_id", "key_prefix", "repo", "base_branch", "work_branch", "template",
-            "instruction", "issue", "model", "provider", "deliver", "max_minutes", "max_iterations", "client_ref",
-            "callback_url", "keep_workspace", "created_at",
-        ]
-        row = {c: fields.get(c) for c in cols}
+        row = {c: fields.get(c) for c in COLS}
         row["phase"] = row["phase"] or ""
         row["instruction"] = row["instruction"] or ""
+        row["plan"] = row["plan"] or ""
+        row["source"] = str(row["source"] or "repo")
+        row["push"] = 1 if row["push"] else 0
         row["keep_workspace"] = 1 if row["keep_workspace"] else 0
+        row["concurrency_limit"] = int(row["concurrency_limit"] or 1)
         row["created_at"] = _iso(row["created_at"])
         for enum_col in ("status", "template", "provider", "deliver"):
             row[enum_col] = str(row[enum_col])
         with self._lock:
             self._conn.execute(
-                f"INSERT INTO tasks ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
-                [row[c] for c in cols],
+                f"INSERT INTO tasks ({', '.join(COLS)}) VALUES ({', '.join('?' for _ in COLS)})",
+                [row[c] for c in COLS],
             )
         return self.get(fields["id"])  # type: ignore[return-value]
 
@@ -161,7 +179,7 @@ class TaskStore:
         self.update(task_id, status=status, phase=phase, **extra)
 
     def request_cancel(self, task_id: str) -> bool:
-        """Mark cancellation. Queued tasks are cancelled right away; active ones at the next checkpoint."""
+        """Mark cancellation. Waiting tasks are cancelled right away; active ones at the next checkpoint."""
         with self._lock:
             row = self._conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if row is None:
@@ -169,7 +187,7 @@ class TaskStore:
             status = TaskStatus(row["status"])
             if status.terminal:
                 return False
-            if status is TaskStatus.QUEUED:
+            if status in (TaskStatus.QUEUED, TaskStatus.AWAITING_UPLOAD):
                 self._conn.execute(
                     "UPDATE tasks SET status = ?, finished_at = ?, cancel_requested = 1 WHERE id = ?",
                     (str(TaskStatus.CANCELLED), _iso(utcnow()), task_id),
@@ -183,48 +201,46 @@ class TaskStore:
             row = self._conn.execute("SELECT cancel_requested FROM tasks WHERE id = ?", (task_id,)).fetchone()
         return bool(row and row["cancel_requested"])
 
-    def claim_next_queued(self) -> TaskView | None:
-        """Atomically move the oldest queued task to `preparing`."""
+    def claim_next_queued(self, busy_keys: dict[str, int] | None = None) -> TaskView | None:
+        """Atomically move the oldest queued task whose client is under its concurrency limit to `preparing`."""
+        busy_keys = busy_keys or {}
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                row = self._conn.execute(
-                    "SELECT id FROM tasks WHERE status = ? ORDER BY created_at, id LIMIT 1",
+                rows = self._conn.execute(
+                    "SELECT id, key_id, concurrency_limit FROM tasks WHERE status = ? ORDER BY created_at, id LIMIT 50",
                     (str(TaskStatus.QUEUED),),
-                ).fetchone()
-                if row is None:
+                ).fetchall()
+                chosen = None
+                for row in rows:
+                    if busy_keys.get(row["key_id"], 0) < int(row["concurrency_limit"]):
+                        chosen = row
+                        break
+                if chosen is None:
                     self._conn.execute("COMMIT")
                     return None
                 self._conn.execute(
                     "UPDATE tasks SET status = ?, phase = 'claimed', started_at = ? WHERE id = ?",
-                    (str(TaskStatus.PREPARING), _iso(utcnow()), row["id"]),
+                    (str(TaskStatus.PREPARING), _iso(utcnow()), chosen["id"]),
                 )
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
-        return self.get(row["id"])
+        return self.get(chosen["id"])
 
     def fail_active_on_restart(self, reason: str) -> list[str]:
-        """Tasks that were active when the process died cannot be resumed (secrets were in memory)."""
+        """Tasks that were waiting or active when the process died cannot be resumed (secrets were in memory)."""
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT id FROM tasks WHERE status IN ({', '.join('?' for _ in ACTIVE_STATUSES)})",
-                [str(s) for s in ACTIVE_STATUSES],
+                f"SELECT id FROM tasks WHERE status IN ({', '.join('?' for _ in RESERVING_STATUSES)})",
+                [str(s) for s in RESERVING_STATUSES],
             ).fetchall()
             ids = [r["id"] for r in rows]
             for tid in ids:
                 self._conn.execute(
                     "UPDATE tasks SET status = ?, phase = '', error = ?, finished_at = ? WHERE id = ?",
                     (str(TaskStatus.FAILED), reason, _iso(utcnow()), tid),
-                )
-            # Queued tasks lost their secrets too.
-            qrows = self._conn.execute("SELECT id FROM tasks WHERE status = ?", (str(TaskStatus.QUEUED),)).fetchall()
-            for r in qrows:
-                ids.append(r["id"])
-                self._conn.execute(
-                    "UPDATE tasks SET status = ?, error = ?, finished_at = ? WHERE id = ?",
-                    (str(TaskStatus.FAILED), reason, _iso(utcnow()), r["id"]),
                 )
         return ids
 
@@ -249,20 +265,30 @@ class TaskStore:
             rows = self._conn.execute(sql, vals).fetchall()
         return [self._view(r) for r in rows]
 
-    def count_active(self) -> int:
+    def count_active(self, key_id: str | None = None) -> int:
+        sql = f"SELECT COUNT(*) AS n FROM tasks WHERE status IN ({', '.join('?' for _ in ACTIVE_STATUSES)})"
+        vals: list[Any] = [str(s) for s in ACTIVE_STATUSES]
+        if key_id:
+            sql += " AND key_id = ?"
+            vals.append(key_id)
         with self._lock:
-            row = self._conn.execute(
-                f"SELECT COUNT(*) AS n FROM tasks WHERE status IN ({', '.join('?' for _ in ACTIVE_STATUSES)})",
-                [str(s) for s in ACTIVE_STATUSES],
-            ).fetchone()
+            row = self._conn.execute(sql, vals).fetchone()
         return int(row["n"])
 
+    def active_by_key(self) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT key_id, COUNT(*) AS n FROM tasks WHERE status IN ({', '.join('?' for _ in ACTIVE_STATUSES)}) "
+                "GROUP BY key_id", [str(s) for s in ACTIVE_STATUSES],
+            ).fetchall()
+        return {r["key_id"]: int(r["n"]) for r in rows}
+
     def minutes_this_month(self, key_id: str, month: str | None = None) -> int:
-        """Billed minutes for a key in a calendar month (YYYY-MM, UTC). Active tasks count at max_minutes."""
+        """Billed minutes for a key in a calendar month (YYYY-MM, UTC). Waiting/active tasks reserve max_minutes."""
         month = month or utcnow().strftime("%Y-%m")
         with self._lock:
             row = self._conn.execute(
-                """SELECT COALESCE(SUM(CASE WHEN status IN ('preparing','running','delivering','queued')
+                """SELECT COALESCE(SUM(CASE WHEN status IN ('awaiting_upload','queued','preparing','running','delivering')
                                             THEN max_minutes ELSE minutes_billed END), 0) AS m
                    FROM tasks WHERE key_id = ? AND substr(created_at, 1, 7) = ?""",
                 (key_id, month),
@@ -306,22 +332,31 @@ class TaskStore:
             row = self._conn.execute("SELECT instruction, issue FROM tasks WHERE id = ?", (task_id,)).fetchone()
         return (row["instruction"], row["issue"]) if row else ("", None)
 
+    def callback_url(self, task_id: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute("SELECT callback_url FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return row["callback_url"] if row and row["callback_url"] else None
+
+    def finished_before(self, before_iso: str) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM tasks WHERE finished_at IS NOT NULL AND finished_at < ?", (before_iso,)
+            ).fetchall()
+        return [r["id"] for r in rows]
+
     # --------------------------------------------------------------- helpers
     @staticmethod
     def _view(row: sqlite3.Row) -> TaskView:
         metrics = TaskMetrics(**json.loads(row["metrics_json"] or "{}"))
         result = TaskResult(**json.loads(row["result_json"])) if row["result_json"] else None
         return TaskView(
-            id=row["id"], status=TaskStatus(row["status"]), phase=row["phase"] or "", template=row["template"],
-            repo=row["repo"], base_branch=row["base_branch"], work_branch=row["work_branch"], model=row["model"],
-            provider=row["provider"], deliver=row["deliver"], key_id=row["key_id"], key_prefix=row["key_prefix"],
+            id=row["id"], status=TaskStatus(row["status"]), phase=row["phase"] or "", source=row["source"],
+            template=row["template"], repo=row["repo"], base_branch=row["base_branch"],
+            work_branch=row["work_branch"], model=row["model"], provider=row["provider"], deliver=row["deliver"],
+            push=bool(row["push"]), key_id=row["key_id"], key_prefix=row["key_prefix"], plan=row["plan"] or "",
             client_ref=row["client_ref"], created_at=_dt(row["created_at"]), started_at=_dt(row["started_at"]),
             finished_at=_dt(row["finished_at"]), max_minutes=int(row["max_minutes"]),
             max_iterations=int(row["max_iterations"]), minutes_billed=int(row["minutes_billed"]),
-            keep_workspace=bool(row["keep_workspace"]), metrics=metrics, error=row["error"], result=result,
+            keep_workspace=bool(row["keep_workspace"]), concurrency_limit=int(row["concurrency_limit"]),
+            metrics=metrics, error=row["error"], result=result, events=int(row["events"] or 0),
         )
-
-    def callback_url(self, task_id: str) -> str | None:
-        with self._lock:
-            row = self._conn.execute("SELECT callback_url FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        return row["callback_url"] if row and row["callback_url"] else None

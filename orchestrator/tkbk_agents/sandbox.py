@@ -1,11 +1,15 @@
 """One sandbox container per task.
 
-Layout per task (host paths; TASKS_ROOT is bind-mounted into the orchestrator at the same path):
-    {TASKS_ROOT}/{task_id}/workspace/        -> /workspace in the sandbox (repo at /workspace/repo)
+Workspace per task lives under TASKS_ROOT/<task_id>/workspace inside the orchestrator container and is
+mounted as /workspace into the sandbox either
+  * from the named volume TASKS_VOLUME (`--mount type=volume,volume-subpath=<id>/workspace`, Docker ≥ 26;
+    works on Linux and Docker Desktop alike — the default in docker-compose.yml), or
+  * as a host bind mount when TASKS_VOLUME is empty (then TASKS_ROOT must be the same absolute path on
+    the host and inside the orchestrator container).
 
-Network: a dedicated `--internal` network `tkbk-task-{id}`; the egress proxy and the
-orchestrator are attached to it for the task's lifetime. The sandbox has no other
-network, so the only way out is HTTP(S)_PROXY -> squid allow-list.
+Network: a dedicated `--internal` network `tkbk-task-<id>`; the egress proxy and the orchestrator
+(and, in stub mode, the LLM stub) are attached to it for the task's lifetime. The sandbox has no
+other network, so the only way out is HTTP(S)_PROXY -> squid allow-list.
 """
 
 from __future__ import annotations
@@ -42,6 +46,8 @@ class SandboxSpec:
     session_key: str
     secret_key: str
     network: str
+    no_proxy: str = "localhost,127.0.0.1"
+    volume: str = ""
     max_concurrent_runs: int = 1
 
     @property
@@ -51,6 +57,13 @@ class SandboxSpec:
     @property
     def base_url(self) -> str:
         return f"http://{self.container}:{SANDBOX_PORT}"
+
+
+def mount_args(spec: SandboxSpec) -> list[str]:
+    if spec.volume:
+        return ["--mount", f"type=volume,source={spec.volume},target={WORKSPACE_IN_SANDBOX},"
+                           f"volume-subpath={spec.task_id}/workspace"]
+    return ["-v", f"{spec.workspace_host_dir}:{WORKSPACE_IN_SANDBOX}"]
 
 
 def run_args(spec: SandboxSpec) -> list[str]:
@@ -70,8 +83,8 @@ def run_args(spec: SandboxSpec) -> list[str]:
         "HTTPS_PROXY": spec.egress_proxy,
         "http_proxy": spec.egress_proxy,
         "https_proxy": spec.egress_proxy,
-        "NO_PROXY": "localhost,127.0.0.1",
-        "no_proxy": "localhost,127.0.0.1",
+        "NO_PROXY": spec.no_proxy,
+        "no_proxy": spec.no_proxy,
         "GIT_TERMINAL_PROMPT": "0",
     }
     args = [
@@ -91,7 +104,7 @@ def run_args(spec: SandboxSpec) -> list[str]:
         "--ulimit", "nofile=65536:65536",
         # no tmpfs on /tmp: the agent-server is a PyInstaller binary that unpacks itself into /tmp
         # and needs an exec-able, disk-backed /tmp (tmpfs would also count against the memory limit).
-        "-v", f"{spec.workspace_host_dir}:{WORKSPACE_IN_SANDBOX}",
+        *mount_args(spec),
         "--restart", "no",
     ]
     for k, v in env.items():
@@ -125,6 +138,8 @@ class Sandbox:
             session_key=secrets.token_urlsafe(32),
             secret_key=secrets.token_urlsafe(32),
             network=f"tkbk-task-{self.task_id}",
+            no_proxy=s.no_proxy,
+            volume=s.tasks_volume,
         )
 
     @property
@@ -149,7 +164,7 @@ class Sandbox:
         uid = self.settings.sandbox_uid
         if not hasattr(os, "chown") or os.name == "nt":
             return
-        for root, dirs, files in os.walk(self.workspace_dir):
+        for root, _dirs, files in os.walk(self.workspace_dir):
             try:
                 os.chown(root, uid, uid)
                 for n in files:
@@ -162,7 +177,7 @@ class Sandbox:
         self.prepare_workspace()
         await d("network", "create", "--internal", "--label", f"{LABEL}={self.task_id}", spec.network)
         self._network_created = True
-        for name in (self.settings.egress_container, self.settings.self_container):
+        for name in self.settings.attach_containers:
             try:
                 await d("network", "connect", spec.network, name)
                 self._attached.append(name)
@@ -259,7 +274,6 @@ async def cleanup_orphans(docker_fn: DockerFn = docker) -> dict[str, int]:
         nets = (await docker_fn("network", "ls", "-q", "--filter", f"label={LABEL}")).split()
         for n in nets:
             try:
-                # Detach whatever is still attached (egress / api), then remove.
                 out = await docker_fn("network", "inspect", "-f", "{{range .Containers}}{{.Name}} {{end}}", n)
                 for name in out.split():
                     await docker_fn("network", "disconnect", "-f", n, name)

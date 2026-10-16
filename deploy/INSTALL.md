@@ -1,81 +1,65 @@
-# Развёртывание на сервере TKBK (194.87.49.168, Ubuntu 24.04, Docker 29)
+# Развёртывание — отдельный VPS (Ubuntu 24.04)
 
-Ничего из этого ещё не выполнялось на сервере — только локальная проверка. Делать после подтверждения владельца.
+Коротко: `deploy/bootstrap.sh` делает всё за 15 минут (README, раздел «Как поднять»). Здесь — что он делает, ручной путь и эксплуатация. На сервер TKBK (194.87.49.168, 2 vCPU / 3.8 ГБ) не ставить: сэндбоксы по 2 vCPU / 4 ГБ.
 
-## 0. Что нужно заранее
+## 0. До запуска
 
-* DNS: `A agents.tkbk.online → 194.87.49.168`.
-* Секрет: `openssl rand -hex 32` → `AGENTS_INTERNAL_SECRET` (его же — в бот/сайт/панель, кто будет звать API).
-* На сервере свободно ≥ 12 ГБ RAM под 2–3 сэндбокса по 4 ГБ (у `tkbk-shop` лимит 512 МБ, Caddy мало) и ≥ 10 ГБ диска (образ agent-server 2 ГБ + клоны).
-* Образы: `ghcr.io/openhands/agent-server:1.55.0-python` (amd64), `ubuntu/squid:6.6-24.04_edge`, `docker:29-cli` (для сборки), `python:3.12-slim-bookworm`.
+* VPS: см. таблицу в README (10 задач → 16–24 vCPU / 48 ГБ / 250 ГБ NVMe). Ubuntu 24.04, root по SSH.
+* DNS: `A agents.tkbk.online → IP VPS` (Caddy выпустит сертификат Let's Encrypt при первом запросе).
+* Сайт tkbk.online должен отдавать `POST /api/license/check` (коммит с лицензиями на main сайта, на 16.10 не задеплоен — без него оркестратор отвечает 403 всем ключам).
 
-## 1. Файлы
+## 1. Автоматически
 
 ```bash
-sudo mkdir -p /opt/tkbk-agents /var/lib/tkbk-agents/tasks
-cd /opt/tkbk-agents
-git clone https://github.com/tkbk-online/tkbk-cloud-agents.git .
-cp .env.example .env && nano .env        # AGENTS_INTERNAL_SECRET, PUBLIC_BASE_URL=https://agents.tkbk.online
+curl -fsSL https://raw.githubusercontent.com/tkbk-online/tkbk-cloud-agents/main/deploy/bootstrap.sh | sudo bash
 ```
 
-`TASKS_ROOT=/var/lib/tkbk-agents/tasks` должен быть **одним и тем же абсолютным путём** на хосте и внутри контейнера `api` (compose так и монтирует) — сэндбоксы bind-mount-ят подкаталоги этого пути через docker.sock хоста.
+Шаги скрипта: docker-ce + compose-plugin, `daemon.json` (address-pools под сети задач, лимит логов), ufw 22/80/443, клон в `/opt/tkbk-agents`, `.env` со свежим секретом и доменом, `docker pull` образа сэндбокса, `docker compose build && up -d`, печать того, что осталось владельцу.
 
-## 2. Сеть Caddy и сборка
+## 2. Вручную (то же самое по шагам)
 
 ```bash
-docker network inspect tkbk_default >/dev/null       # сеть проекта tkbk (Caddy + shop) должна существовать
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin ufw git python3
+ufw default deny incoming && ufw allow 22/tcp && ufw allow 80/tcp && ufw allow 443/tcp && ufw --force enable
+git clone https://github.com/tkbk-online/tkbk-cloud-agents.git /opt/tkbk-agents && cd /opt/tkbk-agents
+cp .env.example .env && nano .env     # AGENTS_INTERNAL_SECRET (openssl rand -hex 32), PUBLIC_BASE_URL, AGENTS_DOMAIN
 docker pull ghcr.io/openhands/agent-server:1.55.0-python
-docker compose build
-docker compose up -d
-docker compose ps && curl -s http://$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' tkbk-agents-api | cut -d' ' -f1):8090/health
+docker compose build && docker compose up -d
+docker compose ps && curl -s https://agents.tkbk.online/health
 ```
 
-Ожидается `{"ok":true,"version":"0.1.0","active":0,"secret_configured":true}`.
+Ожидается `{"ok":true,"version":"0.2.0","active":0,"secret_configured":true,"license_mode":"site"}`.
 
-## 3. Caddy — только правка на месте
-
-`/opt/tkbk-shop/Caddyfile` — bind-mount, **файл не заменять** (заменённый файл отвязывается от контейнера; см. память проекта). Дописать блок и перечитать:
+## 3. Проверки
 
 ```bash
-cat /opt/tkbk-agents/deploy/caddy/agents.tkbk.online.caddy | sudo tee -a /opt/tkbk-shop/Caddyfile >/dev/null
-docker exec tkbk-caddy caddy validate --config /etc/caddy/Caddyfile
-docker exec tkbk-caddy caddy reload   --config /etc/caddy/Caddyfile
-sha256sum /opt/tkbk-shop/Caddyfile; docker exec tkbk-caddy sha256sum /etc/caddy/Caddyfile   # должны совпасть
-curl -s https://agents.tkbk.online/health
+python3 scripts/smoke_sandbox.py                        # 8 проверок сэндбокса и egress (без ключа)
+curl -s https://agents.tkbk.online/v1/me -H "Authorization: Bearer cr_…"   # план и часы по ключу Pro/Teams
 ```
 
-## 4. Смоук без LLM-ключа
+## 4. Первая задача с реальным ключом
 
 ```bash
-cd /opt/tkbk-agents && python3 scripts/smoke_sandbox.py
+curl -s -X POST https://agents.tkbk.online/v1/tasks -H "Authorization: Bearer cr_…" -H "Content-Type: application/json" \
+  -d '{"repoUrl":"https://github.com/tkbk-online/tkbk-mcp","prompt":"добавь тесты для парсера конфигурации","maxMinutes":30}'
+curl -s -N https://agents.tkbk.online/v1/tasks/<id>/events -H "Authorization: Bearer cr_…"
+curl -s https://agents.tkbk.online/v1/tasks/<id>/diff -H "Authorization: Bearer cr_…"
 ```
 
-Должны пройти все 8 проверок (health сэндбокса, нет прямого интернета, прокси пускает api.tkbk.online/PyPI и режет example.com, uid 10001 без capabilities, лимиты в HostConfig).
+Смотреть: `docker ps` (контейнер `tkbk-sbx-t_…`, сеть `tkbk-task-t_…`), `docker exec tkbk-agents-egress tail -f /var/log/squid/access.log` (только allow-list-хосты), `docker compose logs -f api`.
 
-## 5. Первая реальная задача (нужен ключ cr_… и GitHub-токен владельца)
+## 5. Эксплуатация
 
-```bash
-export AGENTS_URL=https://agents.tkbk.online AGENTS_INTERNAL_SECRET=<секрет>
-python3 integrations/client/tkbk_agents_client.py create --key cr_... \
-   --repo https://github.com/tkbk-online/tkbk-api --template add_tests \
-   --instruction "добавь тесты для модуля ключей" --git-token ghp_... --max-minutes 15 --wait
-```
+* `.env` → `LICENSE_PUBLIC_KEY` (публичный Ed25519-ключ из админки сайта): ответы лицензий проверяются по подписи. `AGENTS_INTERNAL_SECRET` — в бот/сайт для HMAC-стороны.
+* Данные: `/opt/tkbk-agents/data/agents.db` (SQLite: задачи, минуты; ключей нет), `data/results/*.patch|*.tgz`, `data/events/*.jsonl` — чистятся джанитором через `RESULTS_TTL_DAYS` (7). Workspaces — volume `tkbk-agents_tasks`, удаляются по концу задачи.
+* Обновление: `git pull && docker compose build && docker compose up -d` при `active: 0` в `/health` (рестарт api = активные задачи `failed`). Версия сэндбокса — `SANDBOX_IMAGE` в `.env`, не `latest`.
+* Allow-list: `deploy/egress/allowlist.txt` → `docker compose restart egress` между задачами.
+* Вариант на хост с уже стоящим Caddy: `deploy/compose.shared-caddy.yml` + блок `deploy/caddy/shared-caddy-block.caddy` (дописывать в Caddyfile на месте, не заменять файл).
 
-Что смотреть: `docker ps` (контейнер `tkbk-sbx-t_…`, сеть `tkbk-task-t_…`), `docker exec tkbk-agents-egress tail -f /var/log/squid/access.log` (только allow-list-хосты), `docker logs -f tkbk-agents-api`. Результат — PR в репозитории, `GET /v1/usage` — минуты по ключу.
-
-## 6. Эксплуатация
-
-* Логи: `docker logs tkbk-agents-api`, `docker exec tkbk-agents-egress tail /var/log/squid/access.log`.
-* Данные: `/opt/tkbk-agents/data/agents.db` (SQLite, учёт минут; ключей там нет), `/opt/tkbk-agents/data/results/*.tgz` (архивы — чистить cron-ом старше 7 дней).
-* Обновление версии agent-server: сменить `SANDBOX_IMAGE` в `.env`, `docker pull`, `docker compose restart api`. Тег `latest-python` не использовать — ломает воспроизводимость.
-* Allow-list: `deploy/egress/allowlist.txt`, затем `docker compose restart egress` (идущие задачи на секунды теряют прокси — делать между задачами).
-* Рестарт `api` = активные задачи `failed` (ключи были в памяти) — делать при `active: 0` в `/health`.
-
-## 7. Откат
+## 6. Откат
 
 ```bash
-cd /opt/tkbk-agents && docker compose down
+cd /opt/tkbk-agents && docker compose --profile stub down -v
 docker ps -aq --filter label=tkbk.cloud-agents | xargs -r docker rm -f
 docker network ls -q --filter label=tkbk.cloud-agents | xargs -r docker network rm
-# убрать блок agents.tkbk.online из /opt/tkbk-shop/Caddyfile (на месте, редактором) и caddy reload
 ```

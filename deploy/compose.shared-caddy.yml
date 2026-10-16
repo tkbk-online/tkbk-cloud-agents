@@ -1,0 +1,72 @@
+# VARIANT for a host that already runs tkbk-caddy (project `tkbk`): joins its network, no own Caddy.
+# Default for a separate VPS is ../docker-compose.yml (with TLS). Run: docker compose -f deploy/compose.shared-caddy.yml --env-file .env up -d
+#
+# TKBK Cloud Agents — server stack (Ubuntu 24.04, Docker 29).
+#
+#   /opt/tkbk-agents/docker-compose.yml   (compose project: tkbk-agents)
+#
+# Services:
+#   api     — orchestrator (REST + HMAC, task queue, billing); starts one sandbox
+#             container per task through the Docker socket.
+#   egress  — squid forward proxy with a domain allow-list; the ONLY way out of a
+#             sandbox (sandboxes live in per-task `--internal` networks).
+#
+# Sandboxes are NOT declared here: the orchestrator runs
+#   ghcr.io/openhands/agent-server:<tag>  per task with cpu/mem/pids limits,
+#   --cap-drop ALL, no-new-privileges, in network tkbk-task-<id> (internal),
+#   HTTP(S)_PROXY=http://tkbk-agents-egress:3128.
+#
+# Caddy (tkbk-caddy, project `tkbk`) stays untouched: we join its network
+# `tkbk_default` and the owner appends deploy/caddy/shared-caddy-block.caddy
+# to /opt/tkbk-shop/Caddyfile in place (see deploy/INSTALL.md).
+
+services:
+  api:
+    build:
+      context: ../orchestrator
+    image: tkbk/cloud-agents-api:0.2.0
+    container_name: tkbk-agents-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      SELF_CONTAINER: tkbk-agents-api
+      EGRESS_CONTAINER: tkbk-agents-egress
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ../data:/data
+      # Same path on host and in the container: sandboxes bind-mount sub-dirs of it.
+      - ${TASKS_ROOT:-/var/lib/tkbk-agents/tasks}:${TASKS_ROOT:-/var/lib/tkbk-agents/tasks}
+    networks:
+      - tkbk_default   # Caddy reaches us as tkbk-agents-api:8090
+      - agents_ctrl
+    expose: ["8090"]
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      egress:
+        condition: service_started
+
+  egress:
+    image: ubuntu/squid:6.6-24.04_edge
+    container_name: tkbk-agents-egress
+    restart: unless-stopped
+    volumes:
+      - ../deploy/egress/squid.conf:/etc/squid/squid.conf:ro
+      - ../deploy/egress/allowlist.txt:/etc/squid/allowlist.txt:ro
+    networks:
+      - agents_ctrl    # per-task internal networks are attached at runtime
+      - agents_egress  # the only network with a route to the Internet
+    mem_limit: 256m
+    # No published ports: reachable only from Docker networks.
+
+networks:
+  tkbk_default:
+    external: true      # created by /opt/tkbk-shop (compose project `tkbk`)
+  agents_ctrl:
+    internal: true
+  agents_egress: {}

@@ -1,0 +1,27 @@
+# TKBK Cloud Agents — standalone VPS. TLS via Let's Encrypt (DNS A record must point here first).
+{
+	email admin@tkbk.online
+}
+
+{$AGENTS_DOMAIN:agents.tkbk.online} {
+	encode zstd gzip
+	reverse_proxy tkbk-agents-api:8090 {
+		# SSE streams and uploads: no buffering, long timeouts.
+		flush_interval -1
+		transport http {
+			read_timeout 1h
+			write_timeout 1h
+		}
+	}
+	request_body {
+		max_size 220MB
+	}
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		-Server
+	}
+	log {
+		output stdout
+	}
+}

@@ -3,6 +3,7 @@ fake GitHub API, and a REAL local git repository standing in for github.com."""
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tarfile
 import time
@@ -13,7 +14,8 @@ import pytest
 from tests.conftest import KEY, FakeAgentServer, FakeDocker, make_settings
 from tkbk_agents import gitops
 from tkbk_agents import runner as runner_mod
-from tkbk_agents.models import Deliver, TaskStatus, Template
+from tkbk_agents.events import EventHub
+from tkbk_agents.models import Deliver, Source, TaskStatus, Template
 from tkbk_agents.runner import DockerRunner, billed_minutes, work_branch_name
 from tkbk_agents.store import TaskSecrets, TaskStore
 
@@ -54,9 +56,9 @@ def local_github(monkeypatch: pytest.MonkeyPatch, origin: Path):
 
 
 def _make(store: TaskStore, **over):
-    d = dict(key_id="kid", key_prefix="cr_abcd…", repo="https://github.com/tkbk-online/demo", template=Template.ADD_TESTS,
-             instruction="cover add()", model="claude-sonnet-5", provider="anthropic", deliver=Deliver.PR,
-             max_minutes=30, max_iterations=50)
+    d = {"key_id": "kid", "key_prefix": "cr_abcd…", "repo": "https://github.com/tkbk-online/demo",
+         "template": Template.ADD_TESTS, "instruction": "cover add()", "model": "claude-sonnet-5",
+         "provider": "anthropic", "deliver": Deliver.PR, "max_minutes": 30, "max_iterations": 50}
     d.update(over)
     return store.create(**d)
 
@@ -84,7 +86,7 @@ async def test_pr_delivery_end_to_end(tmp_path: Path, local_github: Path) -> Non
     server = EditingServer(lambda: repo_dir, statuses=["running", "running", "finished"])
     docker = FakeDocker()
     async with server.client() as http:
-        r = DockerRunner(settings, store, docker_fn=docker, http=http)
+        r = DockerRunner(settings, store, EventHub(settings.events_dir), docker_fn=docker, http=http)
         await r.run(task, TaskSecrets(api_key=KEY, git_token="ghp_tok"))
     final = store.get(task.id)
     assert final is not None and final.status is TaskStatus.DONE, final.error
@@ -94,6 +96,13 @@ async def test_pr_delivery_end_to_end(tmp_path: Path, local_github: Path) -> Non
     assert final.base_branch == "main" and final.minutes_billed >= 1
     assert final.metrics.prompt_tokens == 1000 and final.metrics.iterations == 7
     assert final.result.summary.startswith("Added tests")
+    assert final.result.pushed and final.result.patch_url == f"https://agents.test/v1/tasks/{task.id}/diff"
+    patch_text = (settings.results_dir / f"{task.id}.patch").read_text(encoding="utf-8")
+    assert "+++ b/test_app.py" in patch_text and "def test_add" in patch_text
+    assert final.result.commands == 2 and final.events >= 5
+    log = [json.loads(line) for line in (settings.events_dir / f"{task.id}.events.jsonl").read_text().splitlines()]
+    assert [e["type"] for e in log][:2] == ["status", "status"] and log[-1]["type"] == "done"
+    assert any(e.get("kind") == "action" and e.get("text") == "ls -la" for e in log)
     # the PR was created with the client's token and the agent summary; branch exists in "GitHub"
     assert server.pr_calls[0]["auth"] == "Bearer ghp_tok" and server.pr_calls[0]["head"] == final.work_branch
     assert server.pr_calls[0]["base"] == "main" and "Added tests" in server.pr_calls[0]["body"]
@@ -118,10 +127,10 @@ async def test_archive_delivery(tmp_path: Path, local_github: Path) -> None:
     repo_dir = settings.tasks_root / task.id / "workspace" / "repo"
     server = EditingServer(lambda: repo_dir)
     async with server.client() as http:
-        await DockerRunner(settings, store, docker_fn=FakeDocker(), http=http).run(task, TaskSecrets(api_key=KEY))
+        await DockerRunner(settings, store, EventHub(settings.events_dir), docker_fn=FakeDocker(), http=http).run(task, TaskSecrets(api_key=KEY))
     final = store.get(task.id)
     assert final and final.status is TaskStatus.DONE and final.result
-    assert final.result.archive_url == f"https://agents.test/v1/tasks/{task.id}/archive"
+    assert final.result.archive_url == f"https://agents.test/v1/tasks/{task.id}/artifacts/archive"
     with tarfile.open(settings.results_dir / f"{task.id}.tgz") as tar:
         assert "repo/test_app.py" in tar.getnames()
     assert repo_dir.exists()  # keep_workspace
@@ -136,7 +145,7 @@ async def test_no_changes_is_done_without_pr(tmp_path: Path, local_github: Path)
     task = _make(store)
     server = FakeAgentServer(final="Nothing to do.")
     async with server.client() as http:
-        await DockerRunner(settings, store, docker_fn=FakeDocker(), http=http).run(task, TaskSecrets(KEY, "ghp"))
+        await DockerRunner(settings, store, EventHub(settings.events_dir), docker_fn=FakeDocker(), http=http).run(task, TaskSecrets(KEY, "ghp"))
     final = store.get(task.id)
     assert final and final.status is TaskStatus.DONE and final.result
     assert final.result.pr_url is None and "no file changes" in final.result.summary and not server.pr_calls
@@ -151,7 +160,7 @@ async def test_fix_issue_fetches_issue_text(tmp_path: Path, local_github: Path) 
     server = FakeAgentServer(github_issue={"title": "add() breaks on None", "body": "repro: add(None, 1)",
                                            "html_url": "https://github.com/tkbk-online/demo/issues/12"})
     async with server.client() as http:
-        await DockerRunner(settings, store, docker_fn=FakeDocker(), http=http).run(task, TaskSecrets(KEY, "ghp"))
+        await DockerRunner(settings, store, EventHub(settings.events_dir), docker_fn=FakeDocker(), http=http).run(task, TaskSecrets(KEY, "ghp"))
     prompt = server.conv_requests[0]["initial_message"]["content"][0]["text"]
     assert "issue #12" in prompt and "add() breaks on None" in prompt and "repro: add(None, 1)" in prompt
     store.close()
@@ -175,7 +184,7 @@ async def test_timeout_delivers_draft_pr(tmp_path: Path, local_github: Path, mon
 
     monkeypatch.setattr(runner_mod, "_now", Clock.monotonic)
     async with server.client() as http:
-        await DockerRunner(settings, store, docker_fn=FakeDocker(), http=http).run(task, TaskSecrets(KEY, "ghp"))
+        await DockerRunner(settings, store, EventHub(settings.events_dir), docker_fn=FakeDocker(), http=http).run(task, TaskSecrets(KEY, "ghp"))
     final = store.get(task.id)
     assert final and final.status is TaskStatus.TIMEOUT and "time limit" in (final.error or "")
     assert final.result and final.result.pr_url and server.pr_calls[0]["draft"] is True
@@ -198,7 +207,7 @@ async def test_cancel_during_run(tmp_path: Path, local_github: Path) -> None:
     server = CancellingServer(statuses=["running"])
     docker = FakeDocker()
     async with server.client() as http:
-        await DockerRunner(settings, store, docker_fn=docker, http=http).run(task, TaskSecrets(KEY, "ghp"))
+        await DockerRunner(settings, store, EventHub(settings.events_dir), docker_fn=docker, http=http).run(task, TaskSecrets(KEY, "ghp"))
     final = store.get(task.id)
     assert final and final.status is TaskStatus.CANCELLED and not server.pr_calls
     assert docker.has("rm", "-f")
@@ -212,7 +221,7 @@ async def test_sandbox_failure_is_reported(tmp_path: Path, local_github: Path) -
     task = _make(store)
     docker = FakeDocker(fail_on=lambda a: "no space left on device" if a[:1] == ["run"] else None)
     async with FakeAgentServer().client() as http:
-        await DockerRunner(settings, store, docker_fn=docker, http=http).run(task, TaskSecrets(KEY, "ghp"))
+        await DockerRunner(settings, store, EventHub(settings.events_dir), docker_fn=docker, http=http).run(task, TaskSecrets(KEY, "ghp"))
     final = store.get(task.id)
     assert final and final.status is TaskStatus.FAILED and "no space left" in (final.error or "")
     assert docker.has("network", "rm")  # network cleaned even though run failed
@@ -221,3 +230,29 @@ async def test_sandbox_failure_is_reported(tmp_path: Path, local_github: Path) -
 
 def test_billed_minutes_rounds_up() -> None:
     assert billed_minutes(0) == 1 and billed_minutes(59) == 1 and billed_minutes(61) == 2 and billed_minutes(600) == 10
+
+
+@pytest.mark.asyncio
+async def test_upload_source_patch_only(tmp_path: Path) -> None:
+    """source=upload: no clone, baseline commit, patch against the uploaded state, nothing pushed."""
+    settings = make_settings(tmp_path)
+    store = TaskStore(settings.db_path)
+    task = _make(store, source=Source.UPLOAD, repo=None, deliver=Deliver.PATCH)
+    repo_dir = settings.tasks_root / task.id / "workspace" / "repo"
+    repo_dir.mkdir(parents=True)
+    (repo_dir / "app.py").write_text("def add(a, b):\n    return a + b\n")
+    (repo_dir / "untracked.txt").write_text("uploaded as is\n")
+    server = EditingServer(lambda: repo_dir)
+    docker = FakeDocker()
+    async with server.client() as http:
+        await DockerRunner(settings, store, EventHub(settings.events_dir), docker_fn=docker, http=http).run(
+            task, TaskSecrets(api_key=KEY))
+    final = store.get(task.id)
+    assert final and final.status is TaskStatus.DONE, final.error
+    assert final.result and final.result.changed_files == ["test_app.py"] and not final.result.pushed
+    assert final.result.pr_url is None and final.result.archive_url is None and final.result.patch_url
+    assert final.base_branch == "main" and final.work_branch == f"tkbk/{task.id.removeprefix('t_')}"
+    patch_text = (settings.results_dir / f"{task.id}.patch").read_text(encoding="utf-8")
+    assert "test_app.py" in patch_text and "untracked.txt" not in patch_text
+    assert not any(c[:1] == ["push"] for c in docker.calls)
+    store.close()

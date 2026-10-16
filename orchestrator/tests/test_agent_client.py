@@ -39,6 +39,12 @@ async def test_errors_are_wrapped() -> None:
             await c.run("cid")
         assert await c.final_response("cid") == ""   # swallowed on purpose
 
+    def h409(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json={"detail": "Conversation already running."})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(h409)) as http:
+        await AgentServerClient("http://tkbk-sbx-x:8000", "s", http=http).run("cid")  # already running: fine
+
 
 def test_parse_metrics_is_lenient() -> None:
     assert parse_metrics({}).prompt_tokens == 0

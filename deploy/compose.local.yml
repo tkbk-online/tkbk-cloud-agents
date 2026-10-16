@@ -1,0 +1,15 @@
+# Local override: no Caddy/TLS, API on 127.0.0.1:8090, LLM stub attached to task networks.
+#   docker compose -f docker-compose.yml -f deploy/compose.local.yml --profile stub up -d api egress llm-stub
+services:
+  api:
+    ports: ["127.0.0.1:8090:8090"]
+    environment:
+      PUBLIC_BASE_URL: http://127.0.0.1:8090
+      LICENSE_MODE: stub
+      TKBK_KEY_CHECK: "0"
+      TKBK_OPENAI_BASE_URL: http://tkbk-llm-stub:8089/v1
+      DEFAULT_MODEL: stub
+      SANDBOX_ATTACH_CONTAINERS: tkbk-agents-egress,tkbk-agents-api,tkbk-llm-stub
+      SANDBOX_NO_PROXY: localhost,127.0.0.1,tkbk-llm-stub
+      SANDBOX_MEMORY: 2g
+      SANDBOX_CPUS: "1"

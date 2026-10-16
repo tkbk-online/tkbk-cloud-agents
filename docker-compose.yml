@@ -1,44 +1,56 @@
-# TKBK Cloud Agents — server stack (Ubuntu 24.04, Docker 29).
+# TKBK Cloud Agents — standalone VPS stack (Ubuntu 24.04, Docker ≥ 26).
 #
 #   /opt/tkbk-agents/docker-compose.yml   (compose project: tkbk-agents)
 #
 # Services:
-#   api     — orchestrator (REST + HMAC, task queue, billing); starts one sandbox
-#             container per task through the Docker socket.
-#   egress  — squid forward proxy with a domain allow-list; the ONLY way out of a
-#             sandbox (sandboxes live in per-task `--internal` networks).
+#   caddy   — TLS (Let's Encrypt) for agents.tkbk.online, the only published ports (80/443).
+#   api     — orchestrator (REST, licenses, queue, billing); starts one sandbox container per task
+#             through the Docker socket.
+#   egress  — squid forward proxy with a domain allow-list: the ONLY way out of a sandbox.
+#   llm-stub (profile `stub`) — fake OpenAI endpoint for local runs without a real key.
 #
 # Sandboxes are NOT declared here: the orchestrator runs
 #   ghcr.io/openhands/agent-server:<tag>  per task with cpu/mem/pids limits,
 #   --cap-drop ALL, no-new-privileges, in network tkbk-task-<id> (internal),
-#   HTTP(S)_PROXY=http://tkbk-agents-egress:3128.
+#   HTTP(S)_PROXY=http://tkbk-agents-egress:3128, workspace from the `tasks` volume (volume-subpath).
 #
-# Caddy (tkbk-caddy, project `tkbk`) stays untouched: we join its network
-# `tkbk_default` and the owner appends deploy/caddy/agents.tkbk.online.caddy
-# to /opt/tkbk-shop/Caddyfile in place (see deploy/INSTALL.md).
+# Shared-Caddy variant for a host that already runs tkbk-caddy: deploy/compose.shared-caddy.yml.
 
 services:
+  caddy:
+    image: caddy:2.11
+    container_name: tkbk-agents-caddy
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      AGENTS_DOMAIN: ${AGENTS_DOMAIN:-agents.tkbk.online}
+    networks: [edge]
+    depends_on: [api]
+    mem_limit: 256m
+
   api:
     build:
       context: ./orchestrator
-    image: tkbk/cloud-agents-api:0.1.0
+    image: tkbk/cloud-agents-api:0.2.0
     container_name: tkbk-agents-api
     restart: unless-stopped
     env_file: .env
     environment:
       DATA_DIR: /data
-      SELF_CONTAINER: tkbk-agents-api
-      EGRESS_CONTAINER: tkbk-agents-egress
+      TASKS_ROOT: /var/lib/tkbk-agents/tasks
+      TASKS_VOLUME: ${COMPOSE_PROJECT_NAME:-tkbk-agents}_tasks
+      SANDBOX_ATTACH_CONTAINERS: ${SANDBOX_ATTACH_CONTAINERS:-tkbk-agents-egress,tkbk-agents-api}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./data:/data
-      # Same path on host and in the container: sandboxes bind-mount sub-dirs of it.
-      - ${TASKS_ROOT:-/var/lib/tkbk-agents/tasks}:${TASKS_ROOT:-/var/lib/tkbk-agents/tasks}
-    networks:
-      - tkbk_default   # Caddy reaches us as tkbk-agents-api:8090
-      - agents_ctrl
+      - tasks:/var/lib/tkbk-agents/tasks
+    networks: [edge, agents_ctrl]
     expose: ["8090"]
-    mem_limit: 512m
+    mem_limit: 768m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3).status==200 else 1)"]
       interval: 30s
@@ -59,11 +71,24 @@ services:
       - agents_ctrl    # per-task internal networks are attached at runtime
       - agents_egress  # the only network with a route to the Internet
     mem_limit: 256m
-    # No published ports: reachable only from Docker networks.
+
+  llm-stub:
+    profiles: ["stub"]
+    build:
+      context: ./deploy/llm-stub
+    image: tkbk/cloud-agents-llm-stub:0.2.0
+    container_name: tkbk-llm-stub
+    restart: unless-stopped
+    networks: [agents_ctrl]
+    mem_limit: 64m
 
 networks:
-  tkbk_default:
-    external: true      # created by /opt/tkbk-shop (compose project `tkbk`)
+  edge: {}
   agents_ctrl:
     internal: true
   agents_egress: {}
+
+volumes:
+  tasks: {}
+  caddy_data: {}
+  caddy_config: {}

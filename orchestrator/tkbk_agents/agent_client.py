@@ -7,7 +7,8 @@ Endpoints used:
     POST /api/conversations/{id}/pause
     GET  /api/conversations/{id}
     GET  /api/conversations/{id}/agent_final_response -> {response}
-    GET  /api/conversations/{id}/events/search?limit=…
+    GET  /api/conversations/{id}/events/search?limit=…&page_id=…
+    GET  /api/conversations/{id}/events/count?kind=ActionEvent
 Auth: X-Session-API-Key.
 """
 
@@ -89,7 +90,13 @@ class AgentServerClient:
                                  metrics=parse_metrics(info), raw=info)
 
     async def run(self, conversation_id: str) -> None:
-        await self._req("POST", f"/api/conversations/{conversation_id}/run")
+        """Start the run. A conversation created with `initial_message` is already running (seen live
+        with agent-server 1.55: /run answers 409) — that is success, not an error."""
+        try:
+            await self._req("POST", f"/api/conversations/{conversation_id}/run")
+        except AgentServerError as e:
+            if "HTTP 409" not in str(e):
+                raise
 
     async def pause(self, conversation_id: str) -> None:
         try:
@@ -119,3 +126,17 @@ class AgentServerClient:
             return int(data if isinstance(data, int) else data.get("count", 0))
         except (AgentServerError, ValueError, AttributeError):
             return 0
+
+    async def events_page(self, conversation_id: str, page_id: str | None = None,
+                          limit: int = 100) -> tuple[list[dict[str, Any]], str | None]:
+        """One page of events in timestamp order; returns (items, next_page_id). Never raises."""
+        params: dict[str, Any] = {"limit": limit, "sort_order": "TIMESTAMP"}
+        if page_id:
+            params["page_id"] = page_id
+        try:
+            r = await self._req("GET", f"/api/conversations/{conversation_id}/events/search", params=params)
+            data = r.json()
+        except (AgentServerError, ValueError):
+            return [], page_id
+        items = data.get("items") if isinstance(data, dict) else None
+        return (items or []), (data.get("next_page_id") if isinstance(data, dict) else None)

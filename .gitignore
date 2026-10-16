@@ -13,3 +13,4 @@ node_modules/
 .DS_Store
 .smoke-workspace/
 *.egg-info/
+.tsc/
